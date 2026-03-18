@@ -5,12 +5,12 @@ description = "PostgreSQL Tuning and Analysis Tool"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp[cli]>=1.25.0",
-    "psycopg[binary]>=3.3.2",
+    "mcp[cli]>=1.0.0",
+    "psycopg[binary]>=3.2.0",
     "humanize>=4.15.0",
-    "pglast==7.11",
+    "pglast>=6.0",
     "attrs>=25.4.0",
-    "psycopg-pool>=3.3.0",
+    "psycopg-pool>=3.2.0",
     "instructor>=1.14.4",
 ]
 license = "mit"
