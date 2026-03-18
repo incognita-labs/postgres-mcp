@@ -41,6 +41,8 @@ mcp = FastMCP("postgres-mcp")
 PG_STAT_STATEMENTS = "pg_stat_statements"
 HYPOPG_EXTENSION = "hypopg"
 
+NOT_CONNECTED_ERROR = "Not connected. Call connect(database_uri) first to specify which database to use."
+
 ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
 
 logger = logging.getLogger(__name__)
@@ -59,8 +61,16 @@ current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
 
 
+def require_connection() -> bool:
+    """Check if database connection is established."""
+    return db_connection._is_valid and db_connection.pool is not None
+
+
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
     """Get the appropriate SQL driver based on the current access mode."""
+    if not require_connection():
+        raise ConnectionError(NOT_CONNECTED_ERROR)
+
     base_driver = SqlDriver(conn=db_connection)
 
     if current_access_mode == AccessMode.RESTRICTED:
@@ -82,7 +92,30 @@ def format_error_response(error: str) -> ResponseType:
 
 
 @mcp.tool(
-    description="List all schemas in the database",
+    description="Connect to a PostgreSQL database. Must be called before any other tool.",
+    annotations=ToolAnnotations(
+        title="Connect",
+    ),
+)
+async def connect(
+    database_uri: str = Field(description="PostgreSQL connection URI, e.g. postgresql://localhost:5432/mydb"),
+) -> ResponseType:
+    """Connect or reconnect to a PostgreSQL database."""
+    try:
+        # Close existing connection if any
+        await db_connection.close()
+        db_connection._is_valid = False
+
+        await db_connection.pool_connect(database_uri)
+        logger.info(f"Connected to database: {obfuscate_password(database_uri)}")
+        return format_text_response(f"Connected to {obfuscate_password(database_uri)}")
+    except Exception as e:
+        logger.error(f"Failed to connect: {obfuscate_password(str(e))}")
+        return format_error_response(f"Failed to connect: {obfuscate_password(str(e))}")
+
+
+@mcp.tool(
+    description="List all schemas in the database. Requires connect() first.",
     annotations=ToolAnnotations(
         title="List Schemas",
         readOnlyHint=True,
@@ -108,13 +141,15 @@ async def list_schemas() -> ResponseType:
         )
         schemas = [row.cells for row in rows] if rows else []
         return format_text_response(schemas)
+    except ConnectionError as e:
+        return format_error_response(str(e))
     except Exception as e:
         logger.error(f"Error listing schemas: {e}")
         return format_error_response(str(e))
 
 
 @mcp.tool(
-    description="List objects in a schema",
+    description="List objects in a schema. Requires connect() first.",
     annotations=ToolAnnotations(
         title="List Objects",
         readOnlyHint=True,
@@ -182,13 +217,15 @@ async def list_objects(
             return format_error_response(f"Unsupported object type: {object_type}")
 
         return format_text_response(objects)
+    except ConnectionError as e:
+        return format_error_response(str(e))
     except Exception as e:
         logger.error(f"Error listing objects: {e}")
         return format_error_response(str(e))
 
 
 @mcp.tool(
-    description="Show detailed information about a database object",
+    description="Show detailed information about a database object. Requires connect() first.",
     annotations=ToolAnnotations(
         title="Get Object Details",
         readOnlyHint=True,
@@ -321,13 +358,15 @@ async def get_object_details(
             return format_error_response(f"Unsupported object type: {object_type}")
 
         return format_text_response(result)
+    except ConnectionError as e:
+        return format_error_response(str(e))
     except Exception as e:
         logger.error(f"Error getting object details: {e}")
         return format_error_response(str(e))
 
 
 @mcp.tool(
-    description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.",
+    description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates. Requires connect() first.",
     annotations=ToolAnnotations(
         title="Explain Query",
         readOnlyHint=True,
@@ -406,6 +445,8 @@ If there is no hypothetical index, you can pass an empty list.""",
             if isinstance(result, ErrorResult):
                 error_message = result.to_text()
             return format_error_response(error_message)
+    except ConnectionError as e:
+        return format_error_response(str(e))
     except Exception as e:
         logger.error(f"Error explaining query: {e}")
         return format_error_response(str(e))
@@ -415,20 +456,22 @@ If there is no hypothetical index, you can pass an empty list.""",
 async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
 ) -> ResponseType:
-    """Executes a SQL query against the database."""
+    """Executes a SQL query against the database. Requires connect() first."""
     try:
         sql_driver = await get_sql_driver()
         rows = await sql_driver.execute_query(sql)  # type: ignore
         if rows is None:
             return format_text_response("No results")
         return format_text_response(list([r.cells for r in rows]))
+    except ConnectionError as e:
+        return format_error_response(str(e))
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         return format_error_response(str(e))
 
 
 @mcp.tool(
-    description="Analyze frequently executed queries in the database and recommend optimal indexes",
+    description="Analyze frequently executed queries in the database and recommend optimal indexes. Requires connect() first.",
     annotations=ToolAnnotations(
         title="Analyze Workload Indexes",
         readOnlyHint=True,
@@ -449,13 +492,15 @@ async def analyze_workload_indexes(
         dta_tool = TextPresentation(sql_driver, index_tuning)
         result = await dta_tool.analyze_workload(max_index_size_mb=max_index_size_mb)
         return format_text_response(result)
+    except ConnectionError as e:
+        return format_error_response(str(e))
     except Exception as e:
         logger.error(f"Error analyzing workload: {e}")
         return format_error_response(str(e))
 
 
 @mcp.tool(
-    description="Analyze a list of (up to 10) SQL queries and recommend optimal indexes",
+    description="Analyze a list of (up to 10) SQL queries and recommend optimal indexes. Requires connect() first.",
     annotations=ToolAnnotations(
         title="Analyze Query Indexes",
         readOnlyHint=True,
@@ -482,6 +527,8 @@ async def analyze_query_indexes(
         dta_tool = TextPresentation(sql_driver, index_tuning)
         result = await dta_tool.analyze_queries(queries=queries, max_index_size_mb=max_index_size_mb)
         return format_text_response(result)
+    except ConnectionError as e:
+        return format_error_response(str(e))
     except Exception as e:
         logger.error(f"Error analyzing queries: {e}")
         return format_error_response(str(e))
@@ -497,7 +544,8 @@ async def analyze_query_indexes(
     "- buffer - checks for buffer cache hit rates for indexes and tables\n"
     "- constraint - checks for invalid constraints\n"
     "- all - runs all checks\n"
-    "You can optionally specify a single health check or a comma-separated list of health checks. The default is 'all' checks.",
+    "You can optionally specify a single health check or a comma-separated list of health checks. The default is 'all' checks.\n"
+    "Requires connect() first.",
     annotations=ToolAnnotations(
         title="Analyze Database Health",
         readOnlyHint=True,
@@ -515,14 +563,17 @@ async def analyze_db_health(
         health_type: Comma-separated list of health check types to perform.
                     Valid values: index, connection, vacuum, sequence, replication, buffer, constraint, all
     """
-    health_tool = DatabaseHealthTool(await get_sql_driver())
-    result = await health_tool.health(health_type=health_type)
-    return format_text_response(result)
+    try:
+        health_tool = DatabaseHealthTool(await get_sql_driver())
+        result = await health_tool.health(health_type=health_type)
+        return format_text_response(result)
+    except ConnectionError as e:
+        return format_error_response(str(e))
 
 
 @mcp.tool(
     name="get_top_queries",
-    description=f"Reports the slowest or most resource-intensive queries using data from the '{PG_STAT_STATEMENTS}' extension.",
+    description=f"Reports the slowest or most resource-intensive queries using data from the '{PG_STAT_STATEMENTS}' extension. Requires connect() first.",
     annotations=ToolAnnotations(
         title="Get Top Queries",
         readOnlyHint=True,
@@ -549,6 +600,8 @@ async def get_top_queries(
         else:
             return format_error_response("Invalid sort criteria. Please use 'resources' or 'mean_time' or 'total_time'.")
         return format_text_response(result)
+    except ConnectionError as e:
+        return format_error_response(str(e))
     except Exception as e:
         logger.error(f"Error getting slow queries: {e}")
         return format_error_response(str(e))
@@ -607,7 +660,7 @@ async def main():
     if current_access_mode == AccessMode.UNRESTRICTED:
         mcp.add_tool(
             execute_sql,
-            description="Execute any SQL query",
+            description="Execute any SQL query. Requires connect() first.",
             annotations=ToolAnnotations(
                 title="Execute SQL",
                 destructiveHint=True,
@@ -616,7 +669,7 @@ async def main():
     else:
         mcp.add_tool(
             execute_sql,
-            description="Execute a read-only SQL query",
+            description="Execute a read-only SQL query. Requires connect() first.",
             annotations=ToolAnnotations(
                 title="Execute SQL (Read-Only)",
                 readOnlyHint=True,
@@ -625,25 +678,22 @@ async def main():
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 
-    # Get database URL from environment variable or command line
+    # Optionally connect at startup if DATABASE_URI is provided
     database_url = os.environ.get("DATABASE_URI", args.database_url)
 
-    if not database_url:
-        raise ValueError(
-            "Error: No database URL provided. Please specify via 'DATABASE_URI' environment variable or command-line argument.",
-        )
-
-    # Initialize database connection pool
-    try:
-        await db_connection.pool_connect(database_url)
-        logger.info("Successfully connected to database and initialized connection pool")
-    except Exception as e:
-        logger.warning(
-            f"Could not connect to database: {obfuscate_password(str(e))}",
-        )
-        logger.warning(
-            "The MCP server will start but database operations will fail until a valid connection is established.",
-        )
+    if database_url:
+        try:
+            await db_connection.pool_connect(database_url)
+            logger.info("Successfully connected to database and initialized connection pool")
+        except Exception as e:
+            logger.warning(
+                f"Could not connect to database: {obfuscate_password(str(e))}",
+            )
+            logger.warning(
+                "The MCP server will start but database operations will fail until connect() is called.",
+            )
+    else:
+        logger.info("No database URL provided. Use the connect() tool to establish a connection.")
 
     # Set up proper shutdown handling
     try:
